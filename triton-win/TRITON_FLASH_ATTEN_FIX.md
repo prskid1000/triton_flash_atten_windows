@@ -12,7 +12,7 @@ When running Flash Attention 2.0 with Triton on Windows, you may encounter sever
 2. **Compilation errors**: `-fPIC` flag not supported by MSVC
 3. **Library linking errors**: `libcuda.so.1` not found (Linux library name)
 4. **Header file errors**: `cuda.h` file not found during compilation
-5. **Linker errors**: Error 1181 - cannot find `nvcuda.lib` (Windows linking issue)
+5. **Linker errors**: Error 1181/1104 - cannot find `nvcuda.lib` or Python libraries (Windows linking issues)
 6. **Dynamic library errors**: `dlopen`/`dlsym` functions not available on Windows
 7. **Memory allocation errors**: `posix_memalign` not available on Windows
 8. **Grep command errors**: Unix `grep` command not available
@@ -265,7 +265,7 @@ This prevents linker errors (error 1181) on Windows where `nvcuda.lib` may not b
 
 ---
 
-### Fix 4: Build System - Remove -fPIC Flag
+### Fix 4: Build System - Remove -fPIC Flag and Add Windows Support
 
 **File:** `<venv>\Lib\site-packages\triton\runtime\build.py`  
 **Location:** `_build()` function (around line 43)
@@ -274,7 +274,7 @@ This prevents linker errors (error 1181) on Windows where `nvcuda.lib` may not b
 ```python
 cc_cmd = [cc, src, "-O3", "-shared", "-fPIC", "-Wno-psabi", "-o", so]
 ```
-The `-fPIC` flag is not supported by MSVC on Windows, causing compilation errors.
+The `-fPIC` flag is not supported by MSVC on Windows, causing compilation errors. Additionally, Windows may need Python library directories and warning suppressions.
 
 **Solution:**
 ```python
@@ -284,9 +284,42 @@ The `-fPIC` flag is not supported by MSVC on Windows, causing compilation errors
     if platform.system() != "Windows":
         cc_cmd.append("-fPIC")
     cc_cmd.append("-Wno-psabi")
+    # On Windows, suppress deprecated function warnings and add necessary flags
+    if platform.system() == "Windows":
+        cc_cmd.append("-Wno-deprecated-declarations")
+        # Define _CRT_SECURE_NO_WARNINGS to suppress strcat warnings
+        cc_cmd.append("-D_CRT_SECURE_NO_WARNINGS")
     cc_cmd.append("-o")
     cc_cmd.append(so)
+    cc_cmd += [_library_flag(lib) for lib in libraries]
+    cc_cmd += [f"-L{dir}" for dir in library_dirs]
+    # On Windows, add Python library directory for linking
+    if platform.system() == "Windows":
+        py_lib_dir = sysconfig.get_config_var("LIBDIR")
+        if not py_lib_dir:
+            # Try to find Python libs directory
+            py_prefix = sysconfig.get_config_var("prefix") or sysconfig.get_paths(scheme=scheme).get("data", "")
+            if py_prefix:
+                # Common locations for Python libs on Windows
+                possible_lib_dirs = [
+                    os.path.join(py_prefix, "libs"),
+                    os.path.join(os.path.dirname(py_prefix), "libs"),
+                ]
+                for lib_dir in possible_lib_dirs:
+                    if os.path.exists(lib_dir):
+                        py_lib_dir = lib_dir
+                        break
+        if py_lib_dir and os.path.exists(py_lib_dir):
+            cc_cmd.append(f"-L{py_lib_dir}")
+    cc_cmd += [f"-I{dir}" for dir in include_dirs if dir is not None]
+    cc_cmd.extend(ccflags)
 ```
+
+This fix:
+1. Removes `-fPIC` flag on Windows (not supported by MSVC)
+2. Suppresses deprecated function warnings (`-Wno-deprecated-declarations`)
+3. Defines `_CRT_SECURE_NO_WARNINGS` to suppress `strcat` warnings
+4. Adds Python library directory to linker search path (prevents error 1104)
 
 ---
 
@@ -545,7 +578,7 @@ Apply this change in two places:
 2. **`backends/nvidia/driver.c`** - Fix 5
 
 ### Build System (Required)
-3. **`runtime/build.py`** - Fix 4
+3. **`runtime/build.py`** - Fix 4 (Remove -fPIC, add Windows warnings suppression, add Python library paths)
 
 ### Optional Fixes
 4. **`tools/build_extern.py`** - Fix 6 (only if using build_extern tool)
@@ -596,11 +629,18 @@ After applying all fixes:
 - Check `CUDA_PATH` environment variable
 - Ensure CUDA installation path exists: `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.x\include`
 
+### Linker errors (1104, 1181)
+- **Error 1181**: Usually means `nvcuda.lib` not found - fixed by skipping library linking on Windows
+- **Error 1104**: Usually means Python libraries not found - fixed by adding Python library directory to linker search path
+- Verify Python installation has a `libs` directory
+- Check that CUDA is properly installed
+
 ### Still getting errors
 - Clear Python cache (see Verification section)
 - Verify all fixes were applied correctly
 - Check that you're using a compatible Python version (3.8+)
 - Ensure you have a C compiler installed (Visual Studio Build Tools or Clang)
+- Try running with verbose output: Set `TRITON_VERBOSE=1` environment variable
 
 ## Additional Notes
 
@@ -629,6 +669,8 @@ After applying fixes, verify:
 - [ ] No errors about `cuda.h` not found
 - [ ] No errors about `dlopen`/`dlsym` functions
 - [ ] No errors about `posix_memalign`
+- [ ] No linker errors (1104, 1181)
+- [ ] No deprecated function warnings (strcat)
 - [ ] Flash Attention 2.0 loads successfully
 - [ ] Model inference works with Flash Attention 2.0
 
@@ -639,10 +681,16 @@ After applying fixes, verify:
 **Script Coverage:**
 - ✅ Fix 1: NVIDIA driver - CUDA library path detection
 - ✅ Fix 2: NVIDIA driver - Library name
-- ✅ Fix 3: NVIDIA driver - CUDA include directories
-- ✅ Fix 4: Build system - Remove -fPIC flag
+- ✅ Fix 3: NVIDIA driver - CUDA include directories + Skip library linking on Windows
+- ✅ Fix 4: Build system - Remove -fPIC flag, suppress warnings, add Python library paths
 - ✅ Fix 5: NVIDIA driver.c - Windows compatibility (macro fix)
 - ✅ Fix 6: Build extern tool - Grep command
 - ✅ Fix 7: AMD driver - HIP include directories
 
 **Note**: The script now handles both NVIDIA and AMD backend fixes. AMD driver.c already has Windows compatibility, but the script adds HIP include directory detection.
+
+**Additional Fixes Applied:**
+- **Skip library linking on Windows**: Prevents linker error 1181 (nvcuda.lib not found)
+- **Python library directory**: Prevents linker error 1104 (Python libraries not found)
+- **Warning suppression**: Suppresses deprecated `strcat` warnings on Windows
+

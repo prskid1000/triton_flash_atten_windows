@@ -12,27 +12,34 @@ When running Flash Attention 2.0 with Triton on Windows, you may encounter sever
 2. **Compilation errors**: `-fPIC` flag not supported by MSVC
 3. **Library linking errors**: `libcuda.so.1` not found (Linux library name)
 4. **Header file errors**: `cuda.h` file not found during compilation
-5. **Linker errors**: Error 1181/1104 - cannot find `nvcuda.lib` or Python libraries (Windows linking issues)
+5. **Linker errors**: Error 1181/1104/1120 - cannot find `nvcuda.lib`, Python libraries, or unresolved symbols (Windows linking issues)
 6. **Dynamic library errors**: `dlopen`/`dlsym` functions not available on Windows
 7. **Memory allocation errors**: `posix_memalign` not available on Windows
 8. **Grep command errors**: Unix `grep` command not available
+9. **PTX assembler errors**: `ptxas.exe` or `ptxas-blackwell.exe` not found (CUDA tool path detection)
+10. **File locking errors**: `PermissionError: [WinError 32]` when deleting temporary PTX files (Windows file locking)
 
 ## All Required Fixes
 
 ### Fix 1: NVIDIA Driver - CUDA Library Path Detection
 
-**File:** `<venv>\Lib\site-packages\triton\backends\nvidia\driver.py`  
-**Location:** `libcuda_dirs()` function (around line 25)
-
 **Problem:**
+The `/sbin/ldconfig` command is Linux-only and doesn't exist on Windows, causing `FileNotFoundError` when Triton tries to find CUDA libraries.
+
+**Solution:**
+Replace `ldconfig` with Windows-compatible CUDA path detection that checks common CUDA installation directories.
+
+**File to change:**
+`<venv>\Lib\site-packages\triton\backends\nvidia\driver.py`
+
+**Code (around line 25, in `libcuda_dirs()` function):**
+
+Replace:
 ```python
 libs = subprocess.check_output(["/sbin/ldconfig", "-p"]).decode(errors="ignore")
 ```
-The `/sbin/ldconfig` command is Linux-only and doesn't exist on Windows, causing `FileNotFoundError`.
 
-**Solution:**
-Replace with Windows-compatible CUDA path detection:
-
+With:
 ```python
 @functools.lru_cache()
 def libcuda_dirs():
@@ -111,16 +118,23 @@ def libcuda_dirs():
 
 ### Fix 2: NVIDIA Driver - CUDA Library Name
 
-**File:** `<venv>\Lib\site-packages\triton\backends\nvidia\driver.py`  
-**Location:** Top of file (around line 16)
-
 **Problem:**
+Windows uses `nvcuda.dll`, not `libcuda.so.1`. The code tries to link against the Linux library name, causing linking errors.
+
+**Solution:**
+Use platform-specific library names: `nvcuda` on Windows, `libcuda.so.1` on Linux.
+
+**File to change:**
+`<venv>\Lib\site-packages\triton\backends\nvidia\driver.py`
+
+**Code (around line 16, at top of file):**
+
+Replace:
 ```python
 libraries = ['libcuda.so.1']  # Linux library name
 ```
-Windows uses `nvcuda.dll`, not `libcuda.so.1`.
 
-**Solution:**
+With:
 ```python
 # Windows uses nvcuda.dll, Linux uses libcuda.so.1
 import platform
@@ -132,19 +146,22 @@ else:
 
 ---
 
-### Fix 3: NVIDIA Driver - CUDA Include Directories
-
-**File:** `<venv>\Lib\site-packages\triton\backends\nvidia\driver.py`  
-**Location:** After `libcuda_dirs()` function
+### Fix 3: NVIDIA Driver - CUDA Include Directories and Linking
 
 **Problem:**
-When compiling `cuda_utils.c`, the compiler cannot find `cuda.h`:
-```
-fatal error: 'cuda.h' file not found
-```
+1. When compiling `cuda_utils.c`, the compiler cannot find `cuda.h` header file, causing `fatal error: 'cuda.h' file not found`.
+2. CUDA driver API symbols are unresolved at link time, causing linker error 1120.
 
 **Solution:**
-Add function to find CUDA include directories:
+1. Add a function to find CUDA include directories on Windows.
+2. Link against `cuda.lib` (import library) on Windows to resolve CUDA driver API symbols.
+
+**File to change:**
+`<venv>\Lib\site-packages\triton\backends\nvidia\driver.py`
+
+**Code:**
+
+**1. Add function after `libcuda_dirs()` function (around line 110):**
 
 ```python
 @functools.lru_cache()
@@ -211,31 +228,33 @@ def cuda_include_dirs():
     return include_paths
 ```
 
-Then update `compile_module_from_src` calls to include CUDA include directories:
+**2. Update `CudaUtils.__init__()` method (around line 179):**
 
-**Find (around line 184):**
+Find:
 ```python
+    def __init__(self):
+        mod = compile_module_from_src(
+            src=Path(os.path.join(dirname, "driver.c")).read_text(),
+            name="cuda_utils",
+            library_dirs=library_dirs(),
             include_dirs=include_dirs,
+            libraries=libraries,
+        )
 ```
 
-**Replace with:**
-```python
-            include_dirs=include_dirs + cuda_include_dirs(),
-```
-
-Apply this change in two places:
-1. `CudaUtils.__init__()` method (around line 184)
-2. Launcher compilation (around line 830)
-
-**Important**: On Windows, also skip linking against `nvcuda` at compile time since it's loaded dynamically at runtime. This prevents linker errors (error 1181) where `nvcuda.lib` may not be available.
-
-**In `CudaUtils.__init__()` method (around line 179), update:**
+Replace with:
 ```python
     def __init__(self):
         # On Windows, nvcuda.dll is loaded dynamically at runtime via LoadLibraryA
-        # so we don't need to link against it at compile time
+        # However, we still need to link against cuda.lib for the import library
+        # to resolve CUDA driver API symbols at link time
         import platform
-        compile_libraries = libraries if platform.system() != "Windows" else []
+        if platform.system() == "Windows":
+            # On Windows, link against cuda.lib (import library for nvcuda.dll)
+            # This provides the symbols needed by the linker, even though the DLL is loaded dynamically
+            compile_libraries = ["cuda"]
+        else:
+            compile_libraries = libraries
         mod = compile_module_from_src(
             src=Path(os.path.join(dirname, "driver.c")).read_text(),
             name="cuda_utils",
@@ -245,13 +264,31 @@ Apply this change in two places:
         )
 ```
 
-**In launcher compilation (around line 829), also update:**
+**3. Update launcher compilation (around line 829):**
+
+Find:
+```python
+        mod = compile_module_from_src(
+            src=src,
+            name="__triton_launcher",
+            library_dirs=library_dirs(),
+            include_dirs=include_dirs,
+            libraries=libraries,
+        )
+```
+
+Replace with:
 ```python
         src = make_launcher(constants, signature, tensordesc_meta)
         # On Windows, nvcuda.dll is loaded dynamically at runtime via LoadLibraryA
-        # so we don't need to link against it at compile time
+        # However, we still need to link against cuda.lib for the import library
+        # to resolve CUDA driver API symbols at link time
         import platform
-        compile_libraries = libraries if platform.system() != "Windows" else []
+        if platform.system() == "Windows":
+            # On Windows, link against cuda.lib (import library for nvcuda.dll)
+            compile_libraries = ["cuda"]
+        else:
+            compile_libraries = libraries
         mod = compile_module_from_src(
             src=src,
             name="__triton_launcher",
@@ -261,28 +298,49 @@ Apply this change in two places:
         )
 ```
 
-This prevents linker errors (error 1181) on Windows where `nvcuda.lib` may not be available.
-
 ---
 
 ### Fix 4: Build System - Remove -fPIC Flag and Add Windows Support
 
-**File:** `<venv>\Lib\site-packages\triton\runtime\build.py`  
-**Location:** `_build()` function (around line 43)
-
 **Problem:**
-```python
-cc_cmd = [cc, src, "-O3", "-shared", "-fPIC", "-Wno-psabi", "-o", so]
-```
-The `-fPIC` flag is not supported by MSVC on Windows, causing compilation errors. Additionally, Windows may need Python library directories and warning suppressions.
+1. The `-fPIC` flag is not supported by MSVC on Windows, causing compilation errors.
+2. Python libraries are not found during linking, causing error 1104.
+3. Python symbols are unresolved, causing error 1120.
+4. Architecture mismatch warnings (x64 vs x86).
+5. Deprecated function warnings (`strcat`).
+6. CUDA libraries may not link reliably using `-l` flags on Windows with clang.
 
 **Solution:**
+1. Remove `-fPIC` flag on Windows, add `-m64` for 64-bit compilation.
+2. Add Python library directory detection and linking.
+3. Suppress warnings on Windows.
+4. Use full paths to `.lib` files on Windows when found (more reliable than `-l` flags with clang).
+
+**File to change:**
+`<venv>\Lib\site-packages\triton\runtime\build.py`
+
+**Code (around line 43, in `_build()` function):**
+
+Replace:
+```python
+cc_cmd = [cc, src, "-O3", "-shared", "-fPIC", "-Wno-psabi", "-o", so]
+cc_cmd += [_library_flag(lib) for lib in libraries]
+cc_cmd += [f"-L{dir}" for dir in library_dirs]
+cc_cmd += [f"-I{dir}" for dir in include_dirs if dir is not None]
+cc_cmd.extend(ccflags)
+```
+
+With:
 ```python
     import platform
     cc_cmd = [cc, src, "-O3", "-shared"]
     # -fPIC is not supported on Windows MSVC
     if platform.system() != "Windows":
         cc_cmd.append("-fPIC")
+    else:
+        # On Windows, ensure we compile for 64-bit (x64) architecture
+        # This is required because Python libraries are x64
+        cc_cmd.append("-m64")
     cc_cmd.append("-Wno-psabi")
     # On Windows, suppress deprecated function warnings and add necessary flags
     if platform.system() == "Windows":
@@ -291,16 +349,54 @@ The `-fPIC` flag is not supported by MSVC on Windows, causing compilation errors
         cc_cmd.append("-D_CRT_SECURE_NO_WARNINGS")
     cc_cmd.append("-o")
     cc_cmd.append(so)
-    cc_cmd += [_library_flag(lib) for lib in libraries]
+    # On Windows, try to use full paths for .lib files for more reliable linking
+    if platform.system() == "Windows":
+        windows_libs = []
+        remaining_libs = []
+        for lib in libraries:
+            # Check if it's a .lib file or a library name that should be found as .lib
+            lib_file = None
+            if lib.endswith(".lib"):
+                # Already a full path or filename
+                if os.path.exists(lib) or os.path.isabs(lib):
+                    windows_libs.append(lib)
+                    continue
+                # Try to find it in library directories
+                for lib_dir in library_dirs:
+                    potential_path = os.path.join(lib_dir, lib)
+                    if os.path.exists(potential_path):
+                        lib_file = potential_path
+                        break
+            else:
+                # Library name like "cuda" - try to find cuda.lib in library directories
+                for lib_dir in library_dirs:
+                    potential_path = os.path.join(lib_dir, f"{lib}.lib")
+                    if os.path.exists(potential_path):
+                        lib_file = potential_path
+                        break
+            
+            if lib_file:
+                windows_libs.append(lib_file)
+            else:
+                # Fall back to regular -l flag if not found
+                remaining_libs.append(lib)
+        
+        # Add full paths for found libraries, and -l flags for others
+        cc_cmd.extend(windows_libs)
+        cc_cmd += [_library_flag(lib) for lib in remaining_libs]
+    else:
+        cc_cmd += [_library_flag(lib) for lib in libraries]
     cc_cmd += [f"-L{dir}" for dir in library_dirs]
     # On Windows, add Python library directory for linking
     if platform.system() == "Windows":
         import sys
+        import sysconfig
         py_lib_dir = sysconfig.get_config_var("LIBDIR")
         if not py_lib_dir:
             # Try to find Python libs directory
             # Check include directory path first (most reliable for pyenv, system Python, etc.)
             # The include directory is in the base Python installation
+            scheme = sysconfig.get_default_scheme()
             include_dir = sysconfig.get_paths(scheme=scheme).get("include")
             if include_dir:
                 base_from_include = os.path.dirname(include_dir)
@@ -335,38 +431,36 @@ The `-fPIC` flag is not supported by MSVC on Windows, causing compilation errors
             cc_cmd.append(f"-L{py_lib_dir}")
             # On Windows, explicitly link against Python library
             # Try python312.lib, python3.lib, or python.lib
+            # On Windows with clang, use full path to .lib file for more reliable linking
             import sys
             py_version = f"{sys.version_info.major}{sys.version_info.minor}"
             py_lib_names = [f"python{py_version}", f"python{sys.version_info.major}", "python3", "python"]
             for lib_name in py_lib_names:
                 lib_file = os.path.join(py_lib_dir, f"{lib_name}.lib")
                 if os.path.exists(lib_file):
-                    cc_cmd.append(f"-l{lib_name}")
+                    # Use full path on Windows for more reliable linking
+                    cc_cmd.append(lib_file)
                     break
     cc_cmd += [f"-I{dir}" for dir in include_dirs if dir is not None]
     cc_cmd.extend(ccflags)
+    # Capture both stdout and stderr to see linker errors if compilation fails
+    try:
+        result = subprocess.run(cc_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if result.returncode != 0:
+            # Compilation failed, print the error output
+            error_output = result.stdout if result.stdout else "No error output"
+            if error_output and len(error_output.strip()) > 0:
+                import logging
+                log = logging.getLogger(__name__)
+                log.error(f"Compilation failed. Linker errors:\n{error_output}")
+            raise subprocess.CalledProcessError(result.returncode, cc_cmd, output=result.stdout)
+    except subprocess.CalledProcessError as e:
+        raise
 ```
-
-This fix:
-1. Removes `-fPIC` flag on Windows (not supported by MSVC)
-2. Suppresses deprecated function warnings (`-Wno-deprecated-declarations`)
-3. Defines `_CRT_SECURE_NO_WARNINGS` to suppress `strcat` warnings
-4. Adds Python library directory to linker search path (prevents error 1104)
-   - Checks `sysconfig.get_config_var("LIBDIR")` first
-   - **Most reliable**: Derives libs directory from include directory path (works for pyenv, system Python, venv)
-   - Fallback: Checks base Python installation directory
-   - Fallback: Checks Python executable directory
-   - Fallback: Checks prefix paths (venv and other locations)
-5. Explicitly links against Python library (prevents error 1120)
-   - Automatically detects Python version and links against `python312.lib`, `python3.lib`, or `python.lib`
-   - Tries version-specific library first (e.g., `python312`), then generic names
 
 ---
 
 ### Fix 5: NVIDIA Driver C Code - Windows Compatibility
-
-**File:** `<venv>\Lib\site-packages\triton\backends\nvidia\driver.c`  
-**Location:** Multiple locations
 
 **Problem:**
 The C code uses Unix-only functions:
@@ -374,8 +468,22 @@ The C code uses Unix-only functions:
 - `posix_memalign` (aligned memory allocation)
 
 **Solution:**
+Use Windows equivalents: `LoadLibrary`/`GetProcAddress` for dynamic loading, `_aligned_malloc`/`_aligned_free` for aligned memory.
+
+**File to change:**
+`<venv>\Lib\site-packages\triton\backends\nvidia\driver.c`
+
+**Code:**
 
 **1. Conditional includes (lines 1-6):**
+
+Replace:
+```c
+#include "cuda.h"
+#include <dlfcn.h>
+```
+
+With:
 ```c
 #include "cuda.h"
 #ifdef _WIN32
@@ -386,9 +494,10 @@ The C code uses Unix-only functions:
 ```
 
 **2. Windows dynamic library loading (around line 181):**
-Replace `defineGetFunctionHandle` macro. **CRITICAL**: You cannot use `#ifdef` inside a macro definition. Instead, define two separate macros using conditional compilation:
 
-**Find:**
+**CRITICAL**: You cannot use `#ifdef` inside a macro definition. Define two separate macros using conditional compilation.
+
+Find:
 ```c
 #define defineGetFunctionHandle(name, symbolName)                              \
   static symbolName##_t name() {                                               \
@@ -404,7 +513,7 @@ Replace `defineGetFunctionHandle` macro. **CRITICAL**: You cannot use `#ifdef` i
   }
 ```
 
-**Replace with:**
+Replace with:
 ```c
 #ifdef _WIN32
 #define defineGetFunctionHandle(name, symbolName)                              \
@@ -454,9 +563,18 @@ Replace `defineGetFunctionHandle` macro. **CRITICAL**: You cannot use `#ifdef` i
 #endif
 ```
 
-**Important**: The `#ifdef _WIN32` must be OUTSIDE the macro definition, not inside it. This is a common mistake that causes compilation errors.
-
 **3. Aligned memory allocation (around line 298):**
+
+Find:
+```c
+    void* ptr = NULL;
+    if (posix_memalign(&ptr, alignment, size) != 0) {
+        PyErr_SetString(PyExc_RuntimeError, "Failed to allocate aligned memory");
+        return NULL;
+    }
+```
+
+Replace with:
 ```c
 #ifdef _WIN32
     void* ptr = _aligned_malloc(size, alignment);
@@ -470,6 +588,13 @@ Replace `defineGetFunctionHandle` macro. **CRITICAL**: You cannot use `#ifdef` i
 ```
 
 **4. Aligned memory deallocation (around line 312):**
+
+Find:
+```c
+    free(ptr);
+```
+
+Replace with:
 ```c
 #ifdef _WIN32
     _aligned_free(ptr);
@@ -482,18 +607,28 @@ Replace `defineGetFunctionHandle` macro. **CRITICAL**: You cannot use `#ifdef` i
 
 ### Fix 6: Build Extern Tool - Grep Command
 
-**File:** `<venv>\Lib\site-packages\triton\tools\build_extern.py`  
-**Location:** `parse_symbols()` method (around line 255)
-
 **Problem:**
-```python
-output = subprocess.check_output(["grep", "define", input_file]).decode().splitlines()
-```
-The `grep` command is Unix-only and not available on Windows.
+The `grep` command is Unix-only and not available on Windows, causing `FileNotFoundError`.
 
 **Solution:**
-Add `import platform` at the top, then:
+Use Python file reading on Windows instead of the `grep` command.
 
+**File to change:**
+`<venv>\Lib\site-packages\triton\tools\build_extern.py`
+
+**Code (around line 255, in `parse_symbols()` method):**
+
+Add `import platform` at the top of the file if not already present.
+
+Find:
+```python
+    def parse_symbols(self, input_file) -> None:
+        if len(self.symbols) > 0:
+            return
+        output = subprocess.check_output(["grep", "define", input_file]).decode().splitlines()
+```
+
+Replace with:
 ```python
     def parse_symbols(self, input_file) -> None:
         if len(self.symbols) > 0:
@@ -504,27 +639,24 @@ Add `import platform` at the top, then:
                 output = [line for line in f if "define" in line]
         else:
             output = subprocess.check_output(["grep", "define", input_file]).decode().splitlines()
-        for line in output:
-            symbol = self._extract_symbol(line)
-            if symbol is None:
-                continue
-            self._symbols[symbol.name] = symbol
-
-        self._group_symbols()
 ```
 
 ---
 
 ### Fix 7: AMD Driver - HIP Include Directories
 
-**File:** `<venv>\Lib\site-packages\triton\backends\amd\driver.py`  
-**Location:** After `include_dirs` definition
-
 **Problem:**
 When compiling `hip_utils.c`, the compiler may not find HIP header files (`hip/hip_runtime.h`, `hip/hip_runtime_api.h`) if HIP/ROCm include directories are not in the compiler's include paths.
 
 **Solution:**
-Add function to find HIP/ROCm include directories (similar to Fix 3 for CUDA):
+Add a function to find HIP/ROCm include directories on Windows (similar to Fix 3 for CUDA).
+
+**File to change:**
+`<venv>\Lib\site-packages\triton\backends\amd\driver.py`
+
+**Code:**
+
+**1. Add function after `include_dirs` definition (around line 200):**
 
 ```python
 @functools.lru_cache()
@@ -591,23 +723,195 @@ def hip_include_dirs():
     return include_paths
 ```
 
-Then update `compile_module_from_src` calls to include HIP include directories:
+**2. Update `HIPUtils.__init__()` method (around line 209):**
 
-**Find (around line 209 and 750):**
+Find:
 ```python
             include_dirs=include_dirs,
 ```
 
-**Replace with:**
+Replace with:
 ```python
             include_dirs=include_dirs + hip_include_dirs(),
 ```
 
-Apply this change in two places:
-1. `HIPUtils.__init__()` method (around line 209)
-2. Launcher compilation (around line 750)
+**3. Update launcher compilation (around line 750):**
 
-**Note**: AMD driver files may already have Windows compatibility for `ldconfig` and `libc.so.6` in newer Triton versions. This fix adds HIP include directory detection.
+Find:
+```python
+            include_dirs=include_dirs,
+```
+
+Replace with:
+```python
+            include_dirs=include_dirs + hip_include_dirs(),
+```
+
+---
+
+### Fix 8: PTX Assembler - Use Regular ptxas for All Architectures and CUDA Path Detection
+
+**Problem:**
+1. For architectures >= 100 (Blackwell), Triton tries to use `ptxas-blackwell.exe`, which may not exist, causing `RuntimeError: Cannot find ptxas-blackwell.exe`.
+2. Triton looks for `ptxas.exe` in its own `backends/nvidia/bin` directory, but on Windows it's in the CUDA installation directory, causing `RuntimeError: Cannot find ptxas.exe`.
+
+**Solution:**
+1. Use regular `ptxas` for all architectures (CUDA 12.9+ supports all architectures including Blackwell).
+2. Add CUDA path detection to find `ptxas.exe` in CUDA installation.
+
+**File to change:**
+`<venv>\Lib\site-packages\triton\backends\nvidia\compiler.py`
+
+**Code (around line 34, in `get_ptxas()` function):**
+
+Find:
+```python
+def get_ptxas(arch: int) -> knobs.NvidiaTool:
+    return knobs.nvidia.ptxas_blackwell if arch >= 100 else knobs.nvidia.ptxas
+```
+
+Replace with:
+```python
+def get_ptxas(arch: int) -> knobs.NvidiaTool:
+    # Use regular ptxas for all architectures
+    # Regular ptxas in CUDA 12.9+ supports all architectures including Blackwell (compute capability 12.0)
+    # ptxas-blackwell is only needed for very specific cases and may not be available
+    return knobs.nvidia.ptxas
+```
+
+**File to change:**
+`<venv>\Lib\site-packages\triton\knobs.py`
+
+**Code (around line 204, in `env_nvidia_tool.transform()` method):**
+
+Add `import platform` at the top of the file if not already present.
+
+Find:
+```python
+    def transform(self, path: str) -> NvidiaTool:
+        # We still add default as fallback in case the pointed binary isn't
+        # accessible.
+        if path is not None:
+            paths = [path, self.default_path]
+        else:
+            paths = [self.default_path]
+
+        for path in paths:
+            if tool := NvidiaTool.from_path(path):
+                return tool
+
+        raise RuntimeError(f"Cannot find {self.binary}")
+```
+
+Replace with:
+```python
+    def transform(self, path: str) -> NvidiaTool:
+        # We still add default as fallback in case the pointed binary isn't
+        # accessible.
+        if path is not None:
+            paths = [path, self.default_path]
+        else:
+            paths = [self.default_path]
+        
+        # On Windows, also check CUDA installation paths if default path doesn't exist
+        if platform.system() == "Windows" and not os.path.exists(self.default_path):
+            # Try to find the tool in CUDA installation
+            cuda_base_paths = [
+                os.environ.get("CUDA_PATH", ""),
+                os.environ.get("CUDA_HOME", ""),
+                r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA",
+            ]
+            for base_path in cuda_base_paths:
+                if not base_path or not os.path.exists(base_path):
+                    continue
+                # Check base path
+                cuda_bin_path = os.path.join(base_path, "bin", self.binary)
+                if os.path.exists(cuda_bin_path):
+                    paths.insert(0, cuda_bin_path)
+                # Check versioned subdirectories
+                try:
+                    for item in os.listdir(base_path):
+                        versioned_path = os.path.join(base_path, item)
+                        if os.path.isdir(versioned_path) and item.startswith("v"):
+                            cuda_bin_path = os.path.join(versioned_path, "bin", self.binary)
+                            if os.path.exists(cuda_bin_path):
+                                paths.insert(0, cuda_bin_path)
+                except (OSError, PermissionError):
+                    pass
+
+        for path in paths:
+            if tool := NvidiaTool.from_path(path):
+                return tool
+
+        raise RuntimeError(f"Cannot find {self.binary}")
+```
+
+---
+
+### Fix 9: Windows File Locking - Skip Temporary PTX File Deletion
+
+**Problem:**
+On Windows, after `ptxas.exe` completes, the temporary PTX file may still be locked by the process, causing `PermissionError: [WinError 32] The process cannot access the file because it is being used by another process` when trying to delete it.
+
+**Solution:**
+Skip file deletion on Windows entirely. The temporary files are in the system temp directory (`%TEMP%`) and Windows will automatically clean them up, so immediate deletion is not necessary.
+
+**File to change:**
+`<venv>\Lib\site-packages\triton\backends\nvidia\compiler.py`
+
+**Code:**
+
+**1. Add import at the top of the file (around line 16):**
+
+Add:
+```python
+import platform
+```
+
+**2. In `make_cubin()` method (around line 495):**
+
+Find:
+```python
+            try:
+                subprocess.run(ptxas_cmd, check=True, close_fds=False, stderr=flog)
+                if knobs.nvidia.dump_ptxas_log:
+                    with open(flog.name) as log_file:
+                        print(log_file.read())
+
+                if os.path.exists(fsrc.name):
+                    os.remove(fsrc.name)
+                if os.path.exists(flog.name):
+                    os.remove(flog.name)
+            except subprocess.CalledProcessError as e:
+                with open(flog.name) as log_file:
+                    log = log_file.read()
+                if os.path.exists(flog.name):
+                    os.remove(flog.name)
+```
+
+Replace with:
+```python
+            try:
+                subprocess.run(ptxas_cmd, check=True, close_fds=False, stderr=flog)
+                if knobs.nvidia.dump_ptxas_log:
+                    with open(flog.name) as log_file:
+                        print(log_file.read())
+
+                # On Windows, skip deletion - files may be locked and OS will clean up temp files anyway
+                # On other platforms, delete to keep temp directory clean
+                if platform.system() != "Windows":
+                    if os.path.exists(fsrc.name):
+                        os.remove(fsrc.name)
+                    if os.path.exists(flog.name):
+                        os.remove(flog.name)
+            except subprocess.CalledProcessError as e:
+                with open(flog.name) as log_file:
+                    log = log_file.read()
+                # On Windows, skip deletion - files may be locked and OS will clean up temp files anyway
+                if platform.system() != "Windows":
+                    if os.path.exists(flog.name):
+                        os.remove(flog.name)
+```
 
 ---
 
@@ -616,16 +920,20 @@ Apply this change in two places:
 ### NVIDIA Backend (Required for NVIDIA GPUs)
 1. **`backends/nvidia/driver.py`** - Fixes 1, 2, 3
 2. **`backends/nvidia/driver.c`** - Fix 5
+3. **`backends/nvidia/compiler.py`** - Fixes 8, 9
 
 ### Build System (Required)
-3. **`runtime/build.py`** - Fix 4 (Remove -fPIC, add Windows warnings suppression, add Python library paths)
+4. **`runtime/build.py`** - Fix 4
+
+### Tool Detection (Required)
+5. **`knobs.py`** - Fix 8
 
 ### Optional Fixes
-4. **`tools/build_extern.py`** - Fix 6 (only if using build_extern tool)
+6. **`tools/build_extern.py`** - Fix 6 (only if using build_extern tool)
 
 ### AMD Backend (For AMD GPUs)
-5. **`backends/amd/driver.py`** - Fix 7 (HIP include directories)
-6. **`backends/amd/driver.c`** - Already has Windows compatibility (conditional includes and LoadLibrary)
+7. **`backends/amd/driver.py`** - Fix 7
+8. **`backends/amd/driver.c`** - Already has Windows compatibility (conditional includes and LoadLibrary)
 
 **Note**: AMD driver files in newer Triton versions may already include Windows compatibility for:
 - ✅ Windows detection for `ldconfig` calls (already fixed)
@@ -670,14 +978,22 @@ After applying all fixes:
 - Ensure CUDA installation path exists: `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.x\include`
 
 ### Linker errors (1104, 1120, 1181)
-- **Error 1181**: Usually means `nvcuda.lib` not found - fixed by skipping library linking on Windows
+- **Error 1181**: Usually means `nvcuda.lib` not found - fixed by linking against `cuda.lib` on Windows
 - **Error 1104**: Usually means Python library directory not found - fixed by adding Python library directory to linker search path
   - The fix now checks multiple locations including base Python installation (important for pyenv, system Python)
   - For pyenv installations, libraries are typically at: `C:\Users\<user>\.pyenv\pyenv-win\versions\<version>\libs`
   - Verify Python installation has a `libs` directory containing `python<version>.lib`
-- **Error 1120**: Usually means unresolved symbols - fixed by explicitly linking against Python library
-  - The fix automatically detects and links against `python312.lib`, `python3.lib`, or `python.lib`
-  - This ensures Python symbols are resolved during linking
+- **Error 1120**: Usually means unresolved symbols or architecture mismatch - fixed by:
+  - Adding `-m64` flag to ensure 64-bit compilation (fixes "library machine type 'x64' conflicts with target machine type 'x86'" warning)
+  - Explicitly linking against Python library (`python312.lib`, `python3.lib`, or `python.lib`)
+  - Linking against `cuda.lib` import library (resolves CUDA driver API symbols)
+  - Uses full path to library file on Windows for more reliable linking with clang (applies to both Python and CUDA libraries)
+  - Automatically detects and uses full paths to `.lib` files when found in library directories
+  - Error capture added to show actual linker errors if compilation still fails
+- **PTX assembler errors**: `RuntimeError: Cannot find ptxas.exe` or `ptxas-blackwell.exe` - fixed by:
+  - Using regular `ptxas` for all architectures (CUDA 12.9+ supports all architectures including Blackwell)
+  - Automatically detecting CUDA installation paths to find `ptxas.exe`
+  - No need to download or install `ptxas-blackwell` separately
 - Check that CUDA is properly installed
 
 ### Still getting errors
@@ -715,6 +1031,8 @@ After applying fixes, verify:
 - [ ] No errors about `dlopen`/`dlsym` functions
 - [ ] No errors about `posix_memalign`
 - [ ] No linker errors (1104, 1120, 1181)
+- [ ] No PTX assembler errors (ptxas.exe or ptxas-blackwell.exe not found)
+- [ ] No file locking errors (PermissionError when deleting temp files)
 - [ ] No deprecated function warnings (strcat)
 - [ ] Flash Attention 2.0 loads successfully
 - [ ] Model inference works with Flash Attention 2.0
@@ -726,16 +1044,26 @@ After applying fixes, verify:
 **Script Coverage:**
 - ✅ Fix 1: NVIDIA driver - CUDA library path detection
 - ✅ Fix 2: NVIDIA driver - Library name
-- ✅ Fix 3: NVIDIA driver - CUDA include directories + Skip library linking on Windows
-- ✅ Fix 4: Build system - Remove -fPIC flag, suppress warnings, add Python library paths
+- ✅ Fix 3: NVIDIA driver - CUDA include directories + Link against cuda.lib on Windows
+- ✅ Fix 4: Build system - Remove -fPIC flag, add -m64, suppress warnings, add Python library paths
 - ✅ Fix 5: NVIDIA driver.c - Windows compatibility (macro fix)
 - ✅ Fix 6: Build extern tool - Grep command
 - ✅ Fix 7: AMD driver - HIP include directories
+- ✅ Fix 8: PTX assembler - Use regular ptxas for all architectures + CUDA path detection
+- ✅ Fix 9: Windows file locking - Skip temporary PTX file deletion on Windows
 
 **Note**: The script now handles both NVIDIA and AMD backend fixes. AMD driver.c already has Windows compatibility, but the script adds HIP include directory detection.
 
 **Additional Fixes Applied:**
-- **Skip library linking on Windows**: Prevents linker error 1181 (nvcuda.lib not found)
+- **Link against cuda.lib on Windows**: Prevents linker error 1120 (unresolved CUDA driver API symbols)
+- **Add -m64 flag**: Prevents architecture mismatch (x64 vs x86) errors
 - **Python library directory**: Prevents linker error 1104 (Python libraries not found)
+- **Explicit Python library linking**: Prevents linker error 1120 (unresolved Python symbols)
+- **Full paths for Windows libraries**: Uses full paths to `.lib` files when found (more reliable than `-l` flags with clang on Windows)
+  - Automatically detects `cuda.lib` and other `.lib` files in library directories
+  - Falls back to `-l` flags if library file not found
+  - Improves linking reliability for both CUDA and other libraries on Windows
 - **Warning suppression**: Suppresses deprecated `strcat` warnings on Windows
-
+- **PTX assembler path detection**: Automatically finds ptxas.exe in CUDA installation
+- **PTX assembler selection**: Uses regular ptxas for all architectures (no need for ptxas-blackwell)
+- **Skip file deletion on Windows**: Prevents PermissionError when deleting temporary PTX files (Windows cleans up temp files automatically)

@@ -4,6 +4,8 @@
 
 This document provides a complete guide to fixing Triton and Flash Attention 2.0 on Windows. Triton uses Linux-specific commands and functions that fail on Windows, preventing Flash Attention 2.0 from working properly.
 
+**✅ Status: All critical fixes have been verified and applied to the installed package.**
+
 ## Quick Start: Two Methods to Apply Fixes
 
 ### Method 1: Fix Installed Package (Recommended for Quick Testing)
@@ -32,10 +34,11 @@ When running Flash Attention 2.0 with Triton on Windows, you may encounter sever
 4. **Header file errors**: `cuda.h` file not found during compilation
 5. **Linker errors**: Error 1181/1104/1120 - cannot find `nvcuda.lib`, Python libraries, or unresolved symbols (Windows linking issues)
 6. **Dynamic library errors**: `dlopen`/`dlsym` functions not available on Windows
-7. **Memory allocation errors**: `posix_memalign` not available on Windows
-8. **Grep command errors**: Unix `grep` command not available
-9. **PTX assembler errors**: `ptxas.exe` or `ptxas-blackwell.exe` not found (CUDA tool path detection)
-10. **File locking errors**: `PermissionError: [WinError 32]` when deleting temporary PTX files (Windows file locking)
+7. **Preprocessor errors**: `_WIN32` macro not defined, causing `#ifdef _WIN32` to fail and Unix code to be compiled instead of Windows code
+8. **Memory allocation errors**: `posix_memalign` not available on Windows
+9. **Grep command errors**: Unix `grep` command not available
+10. **PTX assembler errors**: `ptxas.exe` or `ptxas-blackwell.exe` not found (CUDA tool path detection)
+11. **File locking errors**: `PermissionError: [WinError 32]` when deleting temporary PTX files (Windows file locking)
 
 ## All Required Fixes
 
@@ -327,12 +330,14 @@ Replace with:
 4. Architecture mismatch warnings (x64 vs x86).
 5. Deprecated function warnings (`strcat`).
 6. CUDA libraries may not link reliably using `-l` flags on Windows with clang.
+7. **CRITICAL**: `_WIN32` preprocessor macro not defined, causing `#ifdef _WIN32` to fail and Unix code (`dlopen`/`dlsym`) to be compiled instead of Windows code (`LoadLibrary`/`GetProcAddress`).
 
 **Solution:**
 1. Remove `-fPIC` flag on Windows, add `-m64` for 64-bit compilation.
 2. Add Python library directory detection and linking.
 3. Suppress warnings on Windows.
 4. Use full paths to `.lib` files on Windows when found (more reliable than `-l` flags with clang).
+5. **CRITICAL**: Explicitly define `_WIN32` macro with `-D_WIN32` flag so preprocessor conditionals work correctly.
 
 **File to change:**
 `<venv>\Lib\site-packages\triton\runtime\build.py`
@@ -365,6 +370,9 @@ With:
         cc_cmd.append("-Wno-deprecated-declarations")
         # Define _CRT_SECURE_NO_WARNINGS to suppress strcat warnings
         cc_cmd.append("-D_CRT_SECURE_NO_WARNINGS")
+        # CRITICAL: Explicitly define _WIN32 for preprocessor conditionals (#ifdef _WIN32)
+        # This is required so the generated C code uses Windows APIs (LoadLibrary) instead of Unix (dlopen)
+        cc_cmd.append("-D_WIN32")
     cc_cmd.append("-o")
     cc_cmd.append(so)
     # On Windows, try to use full paths for .lib files for more reliable linking
@@ -965,23 +973,32 @@ Replace with:
 
 After applying all fixes:
 
-1. **Clear Python cache:**
+1. **Clear Python cache (if needed):**
    ```powershell
    Remove-Item -Recurse -Force "$env:VIRTUAL_ENV\Lib\site-packages\triton\**\__pycache__"
    ```
 
 2. **Test your script:**
    ```python
+   import torch
    from transformers import Qwen2_5OmniForConditionalGeneration
+   
    model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
        "Qwen/Qwen2.5-Omni-3B",
        device_map="auto",
-       torch_dtype=torch.bfloat16,
+       torch_dtype=torch.float16,
        attn_implementation="flash_attention_2",
    )
    ```
 
-3. **Expected result:** No `FileNotFoundError`, no compilation errors, Flash Attention 2.0 works correctly.
+3. **Expected result:** 
+   - ✅ No `FileNotFoundError` for `ldconfig`
+   - ✅ No compilation errors (`dlfcn.h` not found, `-fPIC` errors, etc.)
+   - ✅ No linker errors (1104, 1120, 1181)
+   - ✅ Flash Attention 2.0 compiles and works correctly
+   - ✅ Model inference works with Flash Attention 2.0
+
+**Note:** If you encounter any errors, check the [Troubleshooting](#troubleshooting) section below.
 
 ## Important Notes
 
@@ -1062,9 +1079,29 @@ model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
   - No need to download or install `ptxas-blackwell` separately
 - Check that CUDA is properly installed
 
+### `dlopen`/`dlsym` errors on Windows (call to undeclared function)
+
+**Problem:**
+Even after applying fixes, you may still see errors like:
+```
+error: call to undeclared function 'dlopen'; ISO C99 and later do not support implicit function declarations
+error: use of undeclared identifier 'RTLD_LAZY'
+error: call to undeclared function 'dlerror'
+error: call to undeclared function 'dlsym'
+```
+
+This occurs when the `_WIN32` macro is not defined during compilation, causing the preprocessor to use the Unix code path (`#else` branch) instead of the Windows code path (`#ifdef _WIN32` branch).
+
+**Solution:**
+Ensure that `-D_WIN32` is explicitly added to the compiler flags in `runtime/build.py` (Fix 4). This flag tells the preprocessor to define `_WIN32`, which activates the Windows-specific code paths in the generated C code.
+
+**Verification:**
+Check that the compiler command includes `-D_WIN32` when compiling on Windows. You can see the full compiler command in the error traceback. The command should include `-D_WIN32` before the `-o` flag.
+
 ### Still getting errors
 - Clear Python cache (see Verification section)
 - Verify all fixes were applied correctly
+- **Check that `-D_WIN32` is in the compiler command** (see error traceback)
 - Check that you're using a compatible Python version (3.8+)
 - Ensure you have a C compiler installed (Visual Studio Build Tools or Clang)
 - Try running with verbose output: Set `TRITON_VERBOSE=1` environment variable
@@ -1094,12 +1131,13 @@ After applying fixes, verify:
 - [ ] No compilation errors for `-fPIC` flag
 - [ ] No errors about `libcuda.so.1` or `nvcuda.dll` not found
 - [ ] No errors about `cuda.h` not found
-- [ ] No errors about `dlopen`/`dlsym` functions
+- [ ] No errors about `dlopen`/`dlsym` functions (check that `-D_WIN32` is in compiler command)
 - [ ] No errors about `posix_memalign`
 - [ ] No linker errors (1104, 1120, 1181)
 - [ ] No PTX assembler errors (ptxas.exe or ptxas-blackwell.exe not found)
 - [ ] No file locking errors (PermissionError when deleting temp files)
 - [ ] No deprecated function warnings (strcat)
+- [ ] Compiler command includes `-D_WIN32` flag (check error traceback)
 - [ ] Flash Attention 2.0 loads successfully
 - [ ] Model inference works with Flash Attention 2.0
 
@@ -1173,26 +1211,29 @@ If you encounter `RuntimeError: Tensor.item() cannot be called on meta tensors` 
 
 ## Status
 
-✅ **All fixes documented** - Use the automated script (`fix_triton_windows.ps1`) to apply all fixes at once, or follow the wheel unpack/repack method above.
+✅ **All fixes verified and applied** - All critical fixes for NVIDIA GPUs on Windows have been verified and are in place.
 
-**Script Coverage:**
-- ✅ Fix 1: NVIDIA driver - CUDA library path detection
-- ✅ Fix 2: NVIDIA driver - Library name
-- ✅ Fix 3: NVIDIA driver - CUDA include directories + Link against cuda.lib on Windows
-- ✅ Fix 4: Build system - Remove -fPIC flag, add -m64, suppress warnings, add Python library paths
-- ✅ Fix 5: NVIDIA driver.c - Windows compatibility (macro fix)
-- ✅ Fix 6: Build extern tool - Grep command
-- ✅ Fix 7: AMD driver - HIP include directories
-- ✅ Fix 8: PTX assembler - Use regular ptxas for all architectures + CUDA path detection
-- ✅ Fix 9: Windows file locking - Skip temporary PTX file deletion on Windows
+**Verification Status (as of latest check):**
+- ✅ Fix 1: NVIDIA driver - CUDA library path detection - **VERIFIED APPLIED**
+- ✅ Fix 2: NVIDIA driver - Library name (`nvcuda` vs `libcuda.so.1`) - **VERIFIED APPLIED**
+- ✅ Fix 3: NVIDIA driver - CUDA include directories + Link against cuda.lib on Windows - **VERIFIED APPLIED**
+- ✅ Fix 4: Build system - Remove -fPIC flag, add -m64, suppress warnings, add Python library paths, define _WIN32 macro - **VERIFIED APPLIED**
+- ✅ Fix 5: NVIDIA driver - Windows compatibility (`dlopen`/`dlsym` → `LoadLibrary`/`GetProcAddress`) - **VERIFIED APPLIED**
+- ✅ Fix 6: Build extern tool - Grep command - **DOCUMENTED** (optional, only if using build_extern tool)
+- ✅ Fix 7: AMD driver - HIP include directories - **DOCUMENTED** (for AMD GPUs only)
+- ✅ Fix 8: PTX assembler - Use regular ptxas for all architectures + CUDA path detection - **VERIFIED APPLIED**
+- ✅ Fix 9: Windows file locking - Skip temporary PTX file deletion on Windows - **VERIFIED APPLIED**
 
-**Note**: The script now handles both NVIDIA and AMD backend fixes. AMD driver.c already has Windows compatibility, but the script adds HIP include directory detection.
-
-**Additional Fixes Applied:**
+**Key Fixes Applied:**
+- **Windows-compatible CUDA library detection**: Replaces `ldconfig` with Windows path detection
+- **Platform-specific library names**: Uses `nvcuda` on Windows, `libcuda.so.1` on Linux
+- **CUDA include directory detection**: Automatically finds CUDA headers on Windows
 - **Link against cuda.lib on Windows**: Prevents linker error 1120 (unresolved CUDA driver API symbols)
-- **Add -m64 flag**: Prevents architecture mismatch (x64 vs x86) errors
-- **Python library directory**: Prevents linker error 1104 (Python libraries not found)
+- **Conditional compilation flags**: Removes `-fPIC` on Windows, adds `-m64` for 64-bit compilation, explicitly defines `_WIN32` macro
+- **Python library directory detection**: Prevents linker error 1104 (Python libraries not found)
 - **Explicit Python library linking**: Prevents linker error 1120 (unresolved Python symbols)
+- **Windows API usage**: Uses `LoadLibrary`/`GetProcAddress` instead of `dlopen`/`dlsym` in generated C code
+- **Conditional header includes**: Uses `windows.h` on Windows, `dlfcn.h` on Linux
 - **Full paths for Windows libraries**: Uses full paths to `.lib` files when found (more reliable than `-l` flags with clang on Windows)
   - Automatically detects `cuda.lib` and other `.lib` files in library directories
   - Falls back to `-l` flags if library file not found
@@ -1201,3 +1242,5 @@ If you encounter `RuntimeError: Tensor.item() cannot be called on meta tensors` 
 - **PTX assembler path detection**: Automatically finds ptxas.exe in CUDA installation
 - **PTX assembler selection**: Uses regular ptxas for all architectures (no need for ptxas-blackwell)
 - **Skip file deletion on Windows**: Prevents PermissionError when deleting temporary PTX files (Windows cleans up temp files automatically)
+
+**Note**: All fixes preserve backward compatibility with Linux/Unix systems. The code uses `platform.system() == "Windows"` checks to apply Windows-specific fixes only on Windows.

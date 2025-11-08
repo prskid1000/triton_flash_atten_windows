@@ -4,6 +4,24 @@
 
 This document provides a complete guide to fixing Triton and Flash Attention 2.0 on Windows. Triton uses Linux-specific commands and functions that fail on Windows, preventing Flash Attention 2.0 from working properly.
 
+## Quick Start: Two Methods to Apply Fixes
+
+### Method 1: Fix Installed Package (Recommended for Quick Testing)
+- Apply fixes to files in `<venv>\Lib\site-packages\triton\` after installation
+- Use the automated script or apply fixes manually
+- **Note:** Fixes are lost if you reinstall Triton
+
+### Method 2: Fix Wheel Before Installation (Recommended for Permanent Fix)
+- Unpack the wheel file, apply fixes, then repack it
+- Install the fixed wheel - no post-installation patching needed
+- **Benefits:** Permanent, shareable, cleaner installation
+- See [Alternative Method: Fix Wheel Directly](#alternative-method-fix-wheel-directly) section below for detailed steps
+
+| Method | Pros | Cons |
+|--------|------|------|
+| **Fix Installed Package** | Quick, no wheel repacking needed | Lost on reinstall, must reapply |
+| **Fix Wheel** | Permanent, shareable, clean | Requires unpacking/repacking wheel |
+
 ## Problem Summary
 
 When running Flash Attention 2.0 with Triton on Windows, you may encounter several errors:
@@ -917,6 +935,8 @@ Replace with:
 
 ## Files Modified Summary
 
+**Note:** File paths below refer to the installed package location (`<venv>\Lib\site-packages\triton\`). When fixing a wheel, use the same paths but in `wheel_extracted/triton/` instead.
+
 ### NVIDIA Backend (Required for NVIDIA GPUs)
 1. **`backends/nvidia/driver.py`** - Fixes 1, 2, 3
 2. **`backends/nvidia/driver.c`** - Fix 5
@@ -971,6 +991,52 @@ After applying all fixes:
 - **Fix 6 is optional**: Only needed if you use the `build_extern.py` tool
 
 ## Troubleshooting
+
+### RuntimeError: Tensor.item() cannot be called on meta tensors
+
+**Problem:**
+When using `device_map="auto"` with transformers models, you may encounter:
+```
+RuntimeError: Tensor.item() cannot be called on meta tensors
+```
+
+This occurs because generation configuration values (e.g., `pad_token_id`, `eos_token_id`) can become tensors on the 'meta' device, and transformers attempts to call `.item()` on them.
+
+**Note:** This is **NOT** a Triton compilation issue. Triton compilation is working correctly. This is a separate issue with how the model handles device placement with `device_map="auto"`.
+
+**Solution:**
+
+This fix involves ensuring tensors are moved to real devices (CUDA or CPU) instead of 'meta' devices. The fix has three parts:
+
+1. **Ensure the model is on a real device (not 'meta')**
+2. **Convert generation config tensor values to Python ints**
+3. **Fall back to `model.config` values if generation config has meta tensors**
+
+**Example fix in `utils.py`:**
+
+```python
+device = device if device is not None else self.device
+# If device is 'meta', use a real device (cuda or cpu) for tensor
+# Meta tensors cannot be used with operations that require actual computation
+if str(device) == 'meta':
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+if isinstance(token, torch.Tensor):
+    # If token is on meta device, move to real device
+    if str(token.device) == 'meta':
+        return token.to(device)
+    return token.to(device)
+```
+
+**Alternative:** Instead of using `device_map="auto"`, explicitly specify the device:
+```python
+model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
+    "Qwen/Qwen2.5-Omni-3B",
+    device_map="cuda",  # or "cpu" instead of "auto"
+    torch_dtype=torch.bfloat16,
+    attn_implementation="flash_attention_2",
+)
+```
 
 ### CUDA not found
 - Verify CUDA Toolkit is installed
@@ -1037,9 +1103,77 @@ After applying fixes, verify:
 - [ ] Flash Attention 2.0 loads successfully
 - [ ] Model inference works with Flash Attention 2.0
 
+## Alternative Method: Fix Wheel Directly
+
+Instead of patching the installed package, you can unpack the wheel, apply fixes, and repack it. This creates a fixed wheel that can be installed without post-installation patching.
+
+### Step-by-Step: Unpack, Fix, and Repack Wheel
+
+**Prerequisites:**
+- Python installed
+- Triton wheel file (`.whl`)
+
+**Steps:**
+
+1. **Unpack the wheel:**
+   ```powershell
+   cd <directory-containing-wheel>
+   python -m zipfile -e "triton-3.5.0+gitc7411ed2-cp312-cp312-win_amd64.whl" wheel_extracted
+   ```
+
+2. **Apply all Triton Windows compatibility fixes** to the extracted files:
+   - Follow Fixes 1-9 in this document, but apply them to files in `wheel_extracted/triton/` instead of `<venv>\Lib\site-packages\triton/`
+   - File paths are the same (e.g., `backends/nvidia/driver.py`, `runtime/build.py`, etc.)
+
+3. **Repack the wheel:**
+   ```powershell
+   cd wheel_extracted
+   python -m zipfile -c ../triton-3.5.0+gitc7411ed2-cp312-cp312-win_amd64-fixed.whl triton triton-3.5.0+gitc7411ed2.dist-info
+   ```
+
+4. **Install the fixed wheel:**
+   ```powershell
+   pip install triton-3.5.0+gitc7411ed2-cp312-cp312-win_amd64-fixed.whl
+   ```
+
+**Optional: Fix Transformers Wheel for Meta Device Issue**
+
+If you encounter `RuntimeError: Tensor.item() cannot be called on meta tensors` when using `device_map="auto"`, you can also fix the transformers wheel:
+
+1. **Unpack transformers wheel:**
+   ```powershell
+   python -m zipfile -e "transformers-*.whl" transformers_extracted
+   ```
+
+2. **Find and fix the utils file** (location varies by transformers version):
+   - Look for files like `transformers_extracted/transformers/utils.py` or similar
+   - Search for device handling code that processes tokens/tensors
+   - Apply the meta device fix (see [RuntimeError: Tensor.item()](#runtimeerror-tensoritem-cannot-be-called-on-meta-tensors) section)
+
+3. **Repack transformers wheel:**
+   ```powershell
+   cd transformers_extracted
+   python -m zipfile -c ../transformers-fixed.whl transformers transformers-*.dist-info
+   ```
+
+4. **Install the fixed transformers wheel:**
+   ```powershell
+   pip install transformers-fixed.whl
+   ```
+
+**Note:** The meta device fix is typically in user code or transformers library, not Triton. If you're using `device_map="auto"`, consider using `device_map="cuda"` instead as a simpler workaround.
+
+**Benefits:**
+- ✅ Fixes are permanent (baked into the wheel)
+- ✅ No need to reapply after reinstalling
+- ✅ Can share the fixed wheel with others
+- ✅ Cleaner installation process
+
+**Note:** The wheel structure uses `backends/nvidia/` paths (not `third_party/nvidia/backend/` like source code).
+
 ## Status
 
-✅ **All fixes documented** - Use the automated script (`fix_triton_windows.ps1`) to apply all fixes at once.
+✅ **All fixes documented** - Use the automated script (`fix_triton_windows.ps1`) to apply all fixes at once, or follow the wheel unpack/repack method above.
 
 **Script Coverage:**
 - ✅ Fix 1: NVIDIA driver - CUDA library path detection

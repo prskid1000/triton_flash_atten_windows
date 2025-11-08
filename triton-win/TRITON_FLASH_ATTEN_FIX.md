@@ -12,9 +12,10 @@ When running Flash Attention 2.0 with Triton on Windows, you may encounter sever
 2. **Compilation errors**: `-fPIC` flag not supported by MSVC
 3. **Library linking errors**: `libcuda.so.1` not found (Linux library name)
 4. **Header file errors**: `cuda.h` file not found during compilation
-5. **Dynamic library errors**: `dlopen`/`dlsym` functions not available on Windows
-6. **Memory allocation errors**: `posix_memalign` not available on Windows
-7. **Grep command errors**: Unix `grep` command not available
+5. **Linker errors**: Error 1181 - cannot find `nvcuda.lib` (Windows linking issue)
+6. **Dynamic library errors**: `dlopen`/`dlsym` functions not available on Windows
+7. **Memory allocation errors**: `posix_memalign` not available on Windows
+8. **Grep command errors**: Unix `grep` command not available
 
 ## All Required Fixes
 
@@ -225,6 +226,42 @@ Then update `compile_module_from_src` calls to include CUDA include directories:
 Apply this change in two places:
 1. `CudaUtils.__init__()` method (around line 184)
 2. Launcher compilation (around line 830)
+
+**Important**: On Windows, also skip linking against `nvcuda` at compile time since it's loaded dynamically at runtime. This prevents linker errors (error 1181) where `nvcuda.lib` may not be available.
+
+**In `CudaUtils.__init__()` method (around line 179), update:**
+```python
+    def __init__(self):
+        # On Windows, nvcuda.dll is loaded dynamically at runtime via LoadLibraryA
+        # so we don't need to link against it at compile time
+        import platform
+        compile_libraries = libraries if platform.system() != "Windows" else []
+        mod = compile_module_from_src(
+            src=Path(os.path.join(dirname, "driver.c")).read_text(),
+            name="cuda_utils",
+            library_dirs=library_dirs(),
+            include_dirs=include_dirs + cuda_include_dirs(),
+            libraries=compile_libraries,
+        )
+```
+
+**In launcher compilation (around line 829), also update:**
+```python
+        src = make_launcher(constants, signature, tensordesc_meta)
+        # On Windows, nvcuda.dll is loaded dynamically at runtime via LoadLibraryA
+        # so we don't need to link against it at compile time
+        import platform
+        compile_libraries = libraries if platform.system() != "Windows" else []
+        mod = compile_module_from_src(
+            src=src,
+            name="__triton_launcher",
+            library_dirs=library_dirs(),
+            include_dirs=include_dirs + cuda_include_dirs(),
+            libraries=compile_libraries,
+        )
+```
+
+This prevents linker errors (error 1181) on Windows where `nvcuda.lib` may not be available.
 
 ---
 
@@ -609,4 +646,3 @@ After applying fixes, verify:
 - ✅ Fix 7: AMD driver - HIP include directories
 
 **Note**: The script now handles both NVIDIA and AMD backend fixes. AMD driver.c already has Windows compatibility, but the script adds HIP include directory detection.
-

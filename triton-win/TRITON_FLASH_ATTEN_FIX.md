@@ -295,22 +295,54 @@ The `-fPIC` flag is not supported by MSVC on Windows, causing compilation errors
     cc_cmd += [f"-L{dir}" for dir in library_dirs]
     # On Windows, add Python library directory for linking
     if platform.system() == "Windows":
+        import sys
         py_lib_dir = sysconfig.get_config_var("LIBDIR")
         if not py_lib_dir:
             # Try to find Python libs directory
-            py_prefix = sysconfig.get_config_var("prefix") or sysconfig.get_paths(scheme=scheme).get("data", "")
-            if py_prefix:
+            # Check include directory path first (most reliable for pyenv, system Python, etc.)
+            # The include directory is in the base Python installation
+            include_dir = sysconfig.get_paths(scheme=scheme).get("include")
+            if include_dir:
+                base_from_include = os.path.dirname(include_dir)
+                libs_from_include = os.path.join(base_from_include, "libs")
+                if os.path.exists(libs_from_include):
+                    py_lib_dir = libs_from_include
+            
+            if not py_lib_dir:
+                # Fallback: Check base Python installation (for pyenv, system Python, etc.)
+                py_base = sysconfig.get_config_var("base")
+                py_prefix = sysconfig.get_config_var("prefix") or sysconfig.get_paths(scheme=scheme).get("data", "")
+                # Get Python executable directory (for pyenv installations)
+                py_exec_dir = os.path.dirname(os.path.dirname(sys.executable)) if hasattr(sys, 'executable') else None
+                
                 # Common locations for Python libs on Windows
-                possible_lib_dirs = [
-                    os.path.join(py_prefix, "libs"),
-                    os.path.join(os.path.dirname(py_prefix), "libs"),
-                ]
+                possible_lib_dirs = []
+                if py_base:
+                    possible_lib_dirs.append(os.path.join(py_base, "libs"))
+                if py_exec_dir:
+                    possible_lib_dirs.append(os.path.join(py_exec_dir, "libs"))
+                if py_prefix:
+                    possible_lib_dirs.extend([
+                        os.path.join(py_prefix, "libs"),
+                        os.path.join(os.path.dirname(py_prefix), "libs"),
+                    ])
+                
                 for lib_dir in possible_lib_dirs:
-                    if os.path.exists(lib_dir):
+                    if lib_dir and os.path.exists(lib_dir):
                         py_lib_dir = lib_dir
                         break
         if py_lib_dir and os.path.exists(py_lib_dir):
             cc_cmd.append(f"-L{py_lib_dir}")
+            # On Windows, explicitly link against Python library
+            # Try python312.lib, python3.lib, or python.lib
+            import sys
+            py_version = f"{sys.version_info.major}{sys.version_info.minor}"
+            py_lib_names = [f"python{py_version}", f"python{sys.version_info.major}", "python3", "python"]
+            for lib_name in py_lib_names:
+                lib_file = os.path.join(py_lib_dir, f"{lib_name}.lib")
+                if os.path.exists(lib_file):
+                    cc_cmd.append(f"-l{lib_name}")
+                    break
     cc_cmd += [f"-I{dir}" for dir in include_dirs if dir is not None]
     cc_cmd.extend(ccflags)
 ```
@@ -320,6 +352,14 @@ This fix:
 2. Suppresses deprecated function warnings (`-Wno-deprecated-declarations`)
 3. Defines `_CRT_SECURE_NO_WARNINGS` to suppress `strcat` warnings
 4. Adds Python library directory to linker search path (prevents error 1104)
+   - Checks `sysconfig.get_config_var("LIBDIR")` first
+   - **Most reliable**: Derives libs directory from include directory path (works for pyenv, system Python, venv)
+   - Fallback: Checks base Python installation directory
+   - Fallback: Checks Python executable directory
+   - Fallback: Checks prefix paths (venv and other locations)
+5. Explicitly links against Python library (prevents error 1120)
+   - Automatically detects Python version and links against `python312.lib`, `python3.lib`, or `python.lib`
+   - Tries version-specific library first (e.g., `python312`), then generic names
 
 ---
 
@@ -629,10 +669,15 @@ After applying all fixes:
 - Check `CUDA_PATH` environment variable
 - Ensure CUDA installation path exists: `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.x\include`
 
-### Linker errors (1104, 1181)
+### Linker errors (1104, 1120, 1181)
 - **Error 1181**: Usually means `nvcuda.lib` not found - fixed by skipping library linking on Windows
-- **Error 1104**: Usually means Python libraries not found - fixed by adding Python library directory to linker search path
-- Verify Python installation has a `libs` directory
+- **Error 1104**: Usually means Python library directory not found - fixed by adding Python library directory to linker search path
+  - The fix now checks multiple locations including base Python installation (important for pyenv, system Python)
+  - For pyenv installations, libraries are typically at: `C:\Users\<user>\.pyenv\pyenv-win\versions\<version>\libs`
+  - Verify Python installation has a `libs` directory containing `python<version>.lib`
+- **Error 1120**: Usually means unresolved symbols - fixed by explicitly linking against Python library
+  - The fix automatically detects and links against `python312.lib`, `python3.lib`, or `python.lib`
+  - This ensures Python symbols are resolved during linking
 - Check that CUDA is properly installed
 
 ### Still getting errors
@@ -669,7 +714,7 @@ After applying fixes, verify:
 - [ ] No errors about `cuda.h` not found
 - [ ] No errors about `dlopen`/`dlsym` functions
 - [ ] No errors about `posix_memalign`
-- [ ] No linker errors (1104, 1181)
+- [ ] No linker errors (1104, 1120, 1181)
 - [ ] No deprecated function warnings (strcat)
 - [ ] Flash Attention 2.0 loads successfully
 - [ ] Model inference works with Flash Attention 2.0
